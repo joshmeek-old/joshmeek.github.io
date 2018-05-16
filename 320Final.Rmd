@@ -1,0 +1,424 @@
+---
+title: "Chunchbase Startup Funding Data"
+output: 
+  html_document:
+    toc: true
+    theme: united
+---
+
+##### By: Joshua Meek
+
+## Introduction
+The current start-up funding lifecycle typically consists of various rounds of funding from angel investors, family offices, venture capitalists, and more. Having insight into the current state of start-up investments can give other founders the opportunity to form business plans and other aspects of their own start-up. Crunchbase is a web platform dedicated to providing this type of insight into every start-up's funding and latest news. Luckily, Crunchbase provides the opportunity to download this data for developers and this report will be using Crunchbase data from the year 2015. First, I will show you how to curate, clean, and parse the data into something that is more manageable. Second, I will process the data and perform exploratory data analysis (along with visualizations) to develop a hypothesis. Finally, I will test the developed hypothesis by applying some machine learning to the dataset.
+
+## Required Language and Libraries
+To perform this analysis one will need the latest version of R along with the following libraries:
+
+- broom
+- caret
+- ggplot2
+- purrr
+- randomForest
+- ROCR
+- tidyverse
+
+The latest version of R can be download from [https://www.r-project.org/](https://www.r-project.org/)
+
+The following code block imports all of the required libraries for this report:
+```{r imports, message=FALSE}
+library(broom)
+library(caret)
+library(ggplot2)
+library(purrr)
+library(randomForest)
+library(ROCR)
+library(tidyverse)
+```
+
+## Data Curation
+First, download the Crunchbase 2015 dataset from [https://github.com/notpeter/crunchbase-data](https://github.com/notpeter/crunchbase-data). The ZIP download will come with a series of CSV (comma-separated values) files however the only file we care about for this report is the `rounds.csv` file. We will use the standard libaray in R to read our file into our environment so we can begin the data curation step of the process.
+
+__Note:__ You will need to make sure that R is reading the file from the working directory or in a path that points to subdirectory (branching from the working directory). For more information visit [http://rfunction.com/archives/1001](http://rfunction.com/archives/1001)
+
+```{r load_csv}
+# Load the data
+rounds_data <- read.csv('rounds.csv')
+
+# Show only the first row
+rounds_data %>% head(2)
+```
+
+### A Peek at the Data
+Although the output is not pleasant to look at (yet), we can now see some of the features that are present in our dataset. For a given funding round of a company we have: company_permalink, company_name, company_category_list, company_country_code, company_state_code, company_region, company_city, funding_round_permalink, funding_round_type, funding_round_code, funding_at, and raised_amount_usd.
+
+### Tidying the Data
+To perform any analysis on our dataset we first want to make sure that the columns in the dataframe are of their appropriate types. We can use the `sapply` function to check the types of each column in our dataset.
+
+```{r types}
+# Output column types
+sapply(rounds_data, class)
+```
+
+As shown above, by looking at the class of each column in the dataframe, every column is of type `factor` except the `raised_amount_usd` column which is of type `numeric`. By looking both at the names of each column and the two row subset that was shown earlier, all columns need to be of character type except the ones named `funded_at` and `raised_amount_usd`. In addition to that, the column `company_category_list` appears to have multiple values stores in one column, delimited by the `|` character, that need to be split out into separate columns.
+
+_____
+
+To convert the column types from factor to character we will apply the `as.character` function over the columns we wish to mutate. However, was cannot apply this function over every column in the dataframe because there are a couple columns we want to be different types. We can pass in the negation of these columns in order to avoid their conversion. The following code block shows the mutation of the column types and then the updated list of types for each column.
+
+```{r mutate_character}
+# Change column types to character except funded_at and raised_amount_usd
+rounds_data <- rounds_data %>%
+  mutate_at(vars(-funded_at, -raised_amount_usd), as.character)
+
+# Output column types
+sapply(rounds_data, class)
+```
+
+_____
+
+Now we want to change the `funded_at` column to represent the datetime type in order for us to be able to perform exploratory data analysis. First let's look at the format of this column so we can convert it using the proper datetime format.
+
+```{r mutate_datetime_show}
+# Show the first five values
+rounds_data %>%
+  select(company_name, funded_at) %>%
+  slice(1:5)
+```
+
+As shown above, by selecting the `funded_at` column and using the slice command to grab the first five columns, we can see that the datetime data is in the format of `%Y-%m-%d`. For more information on datetime formats visit the link [here](https://msdn.microsoft.com/en-us/library/az4se3k1(v=vs.85).aspx). Now we need to use this format string to convert our factor column into that of a datetime. First we will need to convert the `funded_at` column to character since this operation cannot be performed on a factor (which is the current type). Then we will use the type_convert function with the datetime string `%Y-%m-%d` to parse the column into the correct datetime format.
+
+```{r mutate_datetime_convert}
+# Convert the funded_at column to datetime
+rounds_data <- rounds_data %>%
+  mutate(funded_at = as.character(funded_at)) %>%
+  type_convert(cols(funded_at=col_datetime("%Y-%m-%d")))
+
+# Show the first five values
+rounds_data %>%
+  select(company_name, funded_at) %>%
+  slice(1:5)
+```
+
+_____
+
+The last tidying change we want to make to our dataframe is to separate out the `company_category_list` column into the individual categories that it contains. It is evident that Crunchbase labels any given company with various categories that it could fall into. 
+
+```{r separate_show}
+# Show the first five values
+rounds_data %>%
+  select(company_name, company_category_list) %>%
+  slice(1:5)
+```
+
+The output above shows the first five values for the `company_category_list` column in the dataframe. We can see that the `|` character is the delimeter for the various categories that Crunchbase may label for any given company. There are, however, two challenges that come with this splitting this column. First, different companies have different amount of categories. Second, we need to allow for up to three categories that Crunchbase uses for a company. To do this we will use the separate function. It will use the `|` delimiter to split up the column however we will need to use the regular expression representation `\\|` to match this character. We will also want to use a right fill in order to handle companies which do not have three categories. Finally, we will name these new columns `Category_1`, `Category_2`, `Category_3`.
+
+```{r separate_operation, warning=FALSE}
+# Separate Categories into three columns
+rounds_data <- rounds_data %>%
+  separate(col=company_category_list, sep='\\|', fill='right', into=c('Category_1', 'Category_2', 'Category_3'))
+
+# Show the first five values
+rounds_data %>%
+  select(company_name, Category_1, Category_2, Category_3) %>%
+  slice(1:5)
+```
+
+Now we have three new columns in our dataset used to represent the various column categories that a company can take as categorized by Crunchbase. These can be used in any further analysis if we choose to look at categories.
+
+## Exploratory Data Analysis
+
+In this step of the report, we will perform some exploratory data analysis in order to help us formulate a hypothesis that we can test. We will perform both visual as well as statistical analysis on the Crunchbase dataset.
+
+### Amount Raised Over the Years
+
+Let's first loook at the amount raised in each round, that we have data for, over the lifecycle of the dataset. We need to make a scatterplot and scale the y axis to make the units US dollars. Look at the plot below, it is hard to really see if the amount raised is increasing or just that more start-ups are being funded in recent years. There are definitely some outliers in this data, with one start-up raising over $20 billion in one round.
+
+```{r raised_years_plot, warning=FALSE}
+rounds_data %>%
+  ggplot(aes(x=funded_at, y=raised_amount_usd)) + geom_point() + scale_y_continuous(labels = scales::dollar) + 
+  ylab('Amount Raised') + xlab('Year') + ggtitle('Amount Raised over Time')
+```
+
+Looking at the summary statistics for the `raised_amount_usd` and removing those entries which were missing, we can see that the outliers play a large role in the statistics. With a mean of 10430000, median of 1681000, and standard deviation of 114821248 we can see a large skew in the data. This may not be beneficial for developing our hypothesis but in order to be sure we should also look at the yearly break down for funding.
+
+```{r raised_year_stats}
+# Disable scientific notation
+options(scipen=999)
+
+# Get summary of amount raised
+summary(na.omit(rounds_data$raised_amount_usd))
+
+# Get standard deviation
+sd(na.omit(rounds_data$raised_amount_usd))
+```
+
+### Total Amount Of Rounds per Year
+
+Looking at the total amount of funding rounds per year from the Crunchbase dataset, it is evident that there are more start-ups funded in the recent years. It is very heavily skewed towards the recent years. This is great for start-ups looking for funding but not so great for our analysis. Skew takes away from the central tendency of the data. In making our plot we want to make a new column in the dataframe where we strip out the year only from the `funded_at` column.
+
+```{r total_year_plot}
+rounds_data %>%
+  mutate(year = format(funded_at, format='%Y')) %>%
+  ggplot(aes(x=year)) + geom_bar() + 
+  ylab('Total Funding Rounds') + xlab('Year') + ggtitle('Total Funding Rounds per Year') +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+### Average Amount Raised per Year
+
+Looking at the average amount raised per year tells a different story than we saw above. While the amount of total funding rounds seems to be increasing, the average amount raised seems to be decreasing after the year 2000 (maybe due to the Dot Com Bubble). This provides some interesting insight into our data that was not previously evident. We can see that the largest average, possibly due to the large outliers, lies near the year 2000 which could again be contributed to the Dot Com Bubble. To make this plot we need to again make a year column however we also need to group by those years so we can have one point on the x-axis for each year. We also need to make a new column which is the mean_raised showing the average amount raised grouped by year.
+
+```{r total_amount_year_plot}
+rounds_data %>%
+  mutate(year = format(funded_at, format='%Y')) %>%
+  group_by(year) %>%
+  mutate(mean_raised = mean(na.omit(raised_amount_usd))) %>%
+  ggplot(aes(x=year, y=mean_raised)) + geom_point() + 
+  ylab('Average Raised') + xlab('Year') + ggtitle('Average Amount Raised per Year') +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+Let's look at the breakdown of the average amount raised per year. Now we can see that our large outlier does in fact lie with the year 2000, right before the burst of the Dot Com Bubble. By using the same logic we used to generate the dataset for our plot above, we can make a smaller table that shows each year and the average amount raised for that year. We also want to look at the standard deviations for the amount funded. By looking at that we can see some incredible large standard deviations and also those years where there was no deviation at all.
+
+```{r total_amount_year_stat}
+rounds_data %>%
+  mutate(year = format(funded_at, format='%Y')) %>%
+  group_by(year) %>%
+  mutate(mean_raised = mean(na.omit(raised_amount_usd))) %>%
+  mutate(sd_raised = sd(na.omit(raised_amount_usd))) %>%
+  distinct(year, mean_raised, sd_raised) %>%
+  arrange(desc(year)) %>%
+  print(n=40)
+```
+
+### Round Types and Codes
+
+Let's shift our focus away from direct numbers in funding amounts and instead start to look at the types of funding rounds that are happening.
+
+First let's look at the `funding_round_type` column. As shown in the plot below there is a large focus of funding coming from _seed_ and _venture_ rounds. This is great news for our analysis because _venture_ funding generally takes on 'Series' codes such as A, B, C, or D. You can read more about venture funding [here](https://en.wikipedia.org/wiki/Venture_round). This is starting to lead us down the route of a hypothesis to test.
+
+```{r type_plot}
+rounds_data %>%
+  ggplot(aes(x=funding_round_type)) + geom_bar() + 
+  ylab('Total') + xlab('Funding Type') + ggtitle('Amount of Each Funding Round Type') +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+Taking a table breakdown of the counts, we can again see that the seed and venture round types dominate the dataset.
+
+```{r type_stat}
+rounds_data %>%
+  group_by(funding_round_type) %>%
+  count(funding_round_type)
+```
+
+_____
+
+It is common practice for venture rounds to take on a series code so let's look at a plot of the counts for the series codes. Upon first look it is very evident that there are a large number of NA's in the dataset for `funding_round_code`. Do not let this alarm you, this is due to the other types of funding that does not carry a series code with it. (such as seed, grant, angel, etc...) What is interesting, however, is how the amount of each series code seems to taper off as we move higher up the alphabet. This is interesting because it leads us to believe that less and less startups either need or reach later rounds of funding. Now we have a baseline for generating our hypothesis.
+
+```{r code_plot}
+rounds_data %>%
+  ggplot(aes(x=funding_round_code)) + geom_bar() + 
+  ylab('Total') + xlab('Funding Code') + ggtitle('Amount of Each Funding Round Code')
+```
+
+A brief look at the counts for each series code will again show us the decrease in counts with each later series. It will also show us the large amount of rounds which do not have series codes.
+
+```{r code_stat}
+rounds_data %>%
+  group_by(funding_round_code) %>%
+  count(funding_round_code)
+```
+
+## Machine Learning
+
+In this section of the report we will use supervised machine learning to predict an outcome. We will take our training dataset and determine how well our predictor predicts the test data set.
+
+### Hypothesis
+
+After the exploratory data analysis phase of the report we were able to take a look at the amount raised over the years as well as a breakdown of the types of funding these companies receive. By looking at the codes we could see that there were a larger amount of Series A and Series B funding rounds as compared to the subsequent rounds. We saw that the amount of series funding round codes appeared to decrease over time which will help formulate our hypothesis:
+
+> Does the amount raised in a Series A have an effect on having a Series B funding round?
+
+### Preparing Data
+
+In order to start performing the predictions on our data we need to "trim the fat" on the dataframe. So we are going to remove all rows that do not have `funding_round_code` and only keep the columns we will need for our analysis (`company_name`, `funding_round_code`, `funded_at`, `raised_amount_usd`). Now we can see below that we have this dataframe in place with the appropriate columns.
+
+```{r prepare_data}
+# Keep those with a funding round code and select the columns we want
+coded_rounds_data <- rounds_data %>%
+  filter(!is.na(funding_round_code)) %>%
+  select(company_name, funding_round_code, funded_at, raised_amount_usd)
+
+# Show head
+coded_rounds_data %>%
+  head()
+```
+
+Now we are going to want to make a predictor dataframe with each unique company, the amount raised in Series A, and whether or not that company raised a Series B. To do this, we first group by the company name. Then we append either _yes_ or _no_ to a new column called `series_b` if any of the company's funding rounds include the code _B_. This column also needs to be of type factor with the levels set as either _yes_ or _no_ corresponding to their respective values. Then we filter it to take only the series A funding rounds and remove all rows which do not have a publicly disclosed amount of funding for their Series A. In the end we have a new dataframe with the company name, the amount raised in the Series A, and whether or not the company raised a Series B. 
+
+```{r predictor_df}
+# Generate predictor dataframe
+predictor_df <- coded_rounds_data %>%
+  group_by(company_name) %>%
+  mutate(series_b = ifelse(any(funding_round_code == 'B'), 'yes', 'no')) %>%
+  filter(funding_round_code == 'A') %>%
+  filter(!is.na(raised_amount_usd)) %>%
+  mutate(series_b = factor(series_b, levels=c('yes', 'no'))) %>%
+  select(company_name, series_a_funding=raised_amount_usd, series_b)
+
+# Show head
+predictor_df %>%
+  head()
+```
+
+### Training A Classifier
+
+We need to split up our data into training and testing regions. First, we set the seed of our project to be `0320` to ensure consistent results between runs and if someone were to recreate this experiment. (Read more about seeds in R [here](http://rfunction.com/archives/62)) Now we will be using a random 80/20 split for our data. For our test dataframe we use a random fraction of 20% of the data to generate that dataframe. Then the training dataframe is just the antijoin of the remaining 80% of the data. 
+
+You may wonder why we do this and the answer is simple. We use the training data to run a classification on which essentially attempts to learn a model on how to classify if a company will have a Series B based on the funding from their Series A. Then we take that model and attempt to predict outcome in the testing data (whether a Series B was raised or not) and evaluate the results.
+
+```{r test_train_df}
+# Set seed
+set.seed(0320)
+
+# Make testing dataframe
+test_df <- predictor_df %>%
+  group_by(series_b) %>%
+  sample_frac(.2) %>%
+  ungroup()
+
+# Make training dataframe
+train_df <- predictor_df %>%
+  anti_join(test_df, by='company_name')
+```
+
+Now that we have our testing and training data separate from one another we can fit a model and use it for some predictions. In this example we will be using the Random Forest learning method for classification (learn more about random forest [here](https://en.wikipedia.org/wiki/Random_forest)). In the code below, we learn the random forest using the default parameters. Essentially, we are trying to teach the classifier to come to a conclusion about `series_b` based on the values found in `series_a_funding`; all using the training data.
+
+```{r random_forest, warning=FALSE}
+# Train classifier using training data
+forest <- randomForest(series_b~series_a_funding, data=train_df)
+
+# Output forest
+forest
+```
+
+Now we can make predictions on the test data that we set aside at the beginning of the classification process. Using the predict function in R we can use our random forest classifier to try and predict the Series B outcome on the test data. Note: we take out `company_name` because it is not used in the prediction.
+
+```{r predictions}
+# Use classifier to predict test data
+predictions <- predict(forest, newdata=test_df %>% select(-company_name))
+
+# Show head of predictions
+predictions %>% head()
+```
+
+Let's make a confusion matrix and calculate the error rate for our prediction. Judging by the table below, our error rate for this classification is 39.59%
+
+```{r error_rate}
+# Output confusion matrix
+table(pred=predictions, observed=test_df$series_b)
+```
+
+### Cross-validation
+
+Now it is time to perform some cross validation on our random forest classifiers. For this example we will be using 10-fold cross-validation with two random forests: one with 10 trees and one with 1000 trees. To read more about 10-fold cross-validation visit the link [here](https://www.openml.org/a/estimation-procedures/1).
+
+First we want to set our seed similar to what we did in the last random forest we ran. Then we want to use the createFolds function with k=10 folds to perform our experiment. In each iteration we make two dataframes, one for testing and one for training. Then we generate two random forest classifiers, one with 10 trees and one with 1000 trees. Finally, we use predict to test our classifier against the testing data that we created and aggregate the results.
+
+```{r cross-validation}
+# Set seed
+set.seed(0320)
+
+# Perform 10-fold cross-validation
+result_df <- createFolds(predictor_df$series_b, k=10) %>%
+  imap(function(test_indices, fold_number) {
+    
+    # Make testing dataframe
+    test_df <- predictor_df %>%
+      group_by(series_b) %>%
+      sample_frac(.2) %>%
+      ungroup()
+    
+    # Make training dataframe
+    train_df <- predictor_df %>%
+      anti_join(test_df, by='company_name')
+  
+    # Make random forest classifiers
+    forest1 <- randomForest(series_b~series_a_funding, data=train_df, ntree=10)
+    forest2 <- randomForest(series_b~series_a_funding, data=train_df, ntree=1000)
+    
+    # Aggregate results
+    test_df %>%
+      select(observed_label = series_b) %>%
+      mutate(fold=fold_number) %>%
+      mutate(prob_positive_rf1 = predict(forest1, newdata=test_df, type="prob")[,"yes"]) %>%
+      mutate(predicted_label_rf1 = ifelse(prob_positive_rf1 > 0.5, "yes", "no")) %>%
+      mutate(prob_positive_rf2 = predict(forest2, newdata=test_df, type="prob")[, "yes"]) %>%
+      mutate(predicted_label_rf2 = ifelse(prob_positive_rf2 > 0.5, "yes", "no"))
+}) %>%
+  reduce(bind_rows)
+
+# Print results
+result_df
+```
+
+Now we can use our resulting dataframe to get some information about our predictions. Grouping by each fold, we can use linear regression to generate the estimate, standard error, t value, and p value. Looking at the output below, we can see that by attempting to check if a company will raise a Series B based on the amount raised in Series A we came up with a p-value of 0.2077 and a standard error of 0.0027. This output will be discussed more in the Conclusion section.
+
+```{r error_rate_xfold}
+result_df %>%
+  mutate(error_rf1 = observed_label != predicted_label_rf1,
+         error_rf2 = observed_label != predicted_label_rf2) %>%
+  group_by(fold) %>%
+  summarize(big_rf = mean(error_rf1), small_rf = mean(error_rf2)) %>%
+  gather(model, error, -fold) %>%
+  lm(error~model, data=.) %>%
+  tidy()
+```
+
+Before moving on to our conclusion it is beneficial to look at an ROC curve for our resulting dataframe. The ROCR package is used to visualize classifier performance in R and to read more about ROCR visit the link [here](https://rocr.bioinf.mpi-sb.mpg.de/). By looking at this plot we can see that our classifier with 10 trees and our classifier with 1000 trees produce very similar output when it comes to true positives and false positives.
+
+```{r ROCR_plot}
+# List observed labels
+labels <- split(result_df$observed_label, result_df$fold)
+
+# List of predictions (first random forest)
+predictions_rf1 <- split(result_df$prob_positive_rf1, result_df$fold) %>% prediction(labels)
+
+# List of predictions (second random forest)
+predictions_rf2 <- split(result_df$prob_positive_rf2, result_df$fold) %>% prediction(labels)
+
+# Average AUC (first random forest)
+mean_auc_rf1 <- predictions_rf1 %>%
+  performance(measure="auc") %>%
+  slot("y.values") %>% unlist() %>% 
+  mean()
+
+# Average AUC (second random forest)
+mean_auc_rf2 <- predictions_rf2 %>%
+  performance(measure="auc") %>%
+  slot("y.values") %>% unlist() %>% 
+  mean()
+
+# Plot ROC (first random forest)
+predictions_rf1 %>%
+  performance(measure="tpr", x.measure="fpr") %>%
+  plot(avg="threshold", col="orange", lwd=2)
+
+# Plot ROC (second random forest)
+predictions_rf2 %>%
+  performance(measure="tpr", x.measure="fpr") %>%
+  plot(avg="threshold", col="blue", lwd=2, add=TRUE)
+
+# Make plot pretty
+legend("bottomright",
+       legend=paste(c("big", "small"), "rf, AUC:", round(c(mean_auc_rf1, mean_auc_rf2), digits=3)),
+       col=c("orange", "blue"))
+```
+
+## Conclusion
+Now that we have performed some in-depth cross-validation on our classifiers we can come to a conclusion on the hypothesis proposed at the beginning of the _Machine Learning_ section of this report. The hypothesis is: _Does the amount raised in a Series A have an effect on having a Series B funding round?_. In our initial random forest classification we had an error rate of 39.59%. After looking at our analysis of the cross-validation our classifiers came out with a p-value of 0.2077 and a standard error of 0.0027. This p-value is much too high in this case and for that we will rejext the null hypothesis.
+
+Since the null hypothesis is rejected, that does not necessarily imply that the amount raised in a Series A has no effect in the likelihood of a Series B happening. It could mean that there are other factors into account when looking at the likelihood of a Series B happening for any given company. And this is definitely true because there are other data points that need to be looked at when trying to predict the likelihood of a Series B. Things such as expenditures, revenues, company culture, location, and more are all viable candidates for looking into this. The Crunchbase data however does not directly include all of this data due to the fact that these are private companies who do not publically share these statistics.
+
+All in all this dataset is very useful for someone looking to get a peek into the industry for possible pitfalls, competitors, and opportunities however the one area is lacks is the individual company financials. I encourage the reader of this report to do their own analysis on this data and see what else they could experiment with. I also encourage looking online for more robust financial information because that could provide and even more in-depth look into the start-up ecosystem.
